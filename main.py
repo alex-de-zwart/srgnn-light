@@ -80,24 +80,27 @@ class GatedSessionGraphConv(pyg.nn.conv.MessagePassing):
     def message_and_aggregate(self, adj_t, x):
         return matmul(adj_t, x, reduce=self.aggr)
 
-class SRGNN(nn.Module):
-    def __init__(self, hidden_size, n_items):
-        super(SRGNN, self).__init__()
-        self.hidden_size = hidden_size
+
+class LightGCN(MessagePassing):
+    """LightGCN Model as proposed in https://arxiv.org/abs/2002.02126
+    """
+
+    def __init__(self, hidden_size, n_items, K=3, add_self_loops=False):
+        """Initializes LightGCN Model
+
+        Args:
+            embedding_dim (int, optional): Dimensionality of embeddings. Defaults to 8.
+            K (int, optional): Number of message passing layers. Defaults to 3.
+            add_self_loops (bool, optional): Whether to add self loops for message passing. Defaults to False.
+        """
+        super().__init__()
+        self.embedding_dim, self.K = hidden_size, K
+        self.add_self_loops = add_self_loops
         self.n_items = n_items
 
-        self.embedding = nn.Embedding(self.n_items, self.hidden_size)
-        self.gated = GatedSessionGraphConv(self.hidden_size)
+        self.embedding = nn.Embedding(self.n_items, self.embedding_dim)
 
-        self.q = nn.Linear(self.hidden_size, 1)
-        self.W_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.W_2 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.W_3 = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
-
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.hidden_size)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
+        nn.init.normal_(self.embedding.weight, std=0.1)
 
     def forward(self, data):
         x, edge_index, batch_map = data.x, data.edge_index, data.batch
@@ -105,42 +108,30 @@ class SRGNN(nn.Module):
         # (0)
         embedding = self.embedding(x).squeeze()
 
-        # (1)-(5)
-        v_i = self.gated(embedding, edge_index)
+        # compute \tilde{A}: symmetrically normalized adjacency matrix
+        edge_index_norm = gcn_norm(
+            edge_index, add_self_loops=self.add_self_loops)
 
-        # Divide nodes by session
-        # For the detailed explanation of what is happening below, please refer
-        # to the Medium blog post.
-        sections = list(torch.bincount(batch_map).cpu())
-        v_i_split = torch.split(v_i, sections)
+        emb_0 = self.embedding.weight  # of list? [embeding.weight]
+        embs = [emb_0]
+        emb_k = emb_0
 
-        v_n, v_n_repeat = [], []
-        for session in v_i_split:
-            v_n.append(session[-1])
-            v_n_repeat.append(
-                session[-1].view(1, -1).repeat(session.shape[0], 1))
-        v_n, v_n_repeat = torch.stack(v_n), torch.cat(v_n_repeat, dim=0)
+        # multi-scale diffusion
+        for i in range(self.K):
+            emb_k = self.propagate(edge_index_norm, x=emb_k)
+            embs.append(emb_k)
 
-        q1 = self.W_1(v_n_repeat)
-        q2 = self.W_2(v_i)
+        embs = torch.stack(embs, dim=1)
+        emb_final = torch.mean(embs, dim=1)  # E^K
 
-        # (6)
-        alpha = self.q(F.sigmoid(q1 + q2))
-        s_g_split = torch.split(alpha * v_i, sections)
+        return emb_final, self.embedding.weight
 
-        s_g = []
-        for session in s_g_split:
-            s_g_session = torch.sum(session, dim=0)
-            s_g.append(s_g_session)
-        s_g = torch.stack(s_g)
+    def message(self, x_j):
+        return x_j
 
-        # (7)
-        s_l = v_n
-        s_h = self.W_3(torch.cat([s_l, s_g], dim=-1))
-
-        # (8)
-        z = torch.mm(self.embedding.weight, s_h.T).T
-        return z
+    def message_and_aggregate(self, adj_t, x):
+        # computes \tilde{A} @ x
+        return matmul(adj_t, x)
 
 def train(args):
     # Prepare data pipeline
